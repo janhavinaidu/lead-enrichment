@@ -15,7 +15,7 @@ Functional prototype to verify the ROX lead-generation pipeline end to end:
 import json
 import os
 import tempfile
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -27,6 +27,7 @@ from services import (
     contact_compass_service,
     email_service,
     groq_service,
+    linkedin_finder_service,
     openoutreach_service,
 )
 
@@ -55,6 +56,8 @@ st.session_state.setdefault("email_drafts", {})          # lead index -> EmailDr
 st.session_state.setdefault("approved", set())
 st.session_state.setdefault("search_ran", False)
 st.session_state.setdefault("emails_generated", False)
+st.session_state.setdefault("discovery_method", "Fast (LLM + Google Search)")
+st.session_state.setdefault("product", "")
 
 
 def debug_expander(title: str, content: str):
@@ -79,7 +82,47 @@ def _lead_from_saved(row: Dict[str, Any]) -> Lead:
     )
 
 
+# ---------------------------------------------------------------------------
+# Cached operations (LLM search, Apify profile enrichment, Contact Compass)
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=86400)
+def cached_find_leads(event_name: str, market: str, num_leads: int, product: str) -> List[Lead]:
+    """Cache lead search results for 24 hours based on search inputs."""
+    return linkedin_finder_service.find_leads(
+        event_name=event_name,
+        market=market,
+        num_leads=num_leads,
+        product=product,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def cached_apify_profile_actor(linkedin_url: str, first_name: str = "", last_name: str = ""):
+    """Cache Apify profile enrichment per LinkedIn URL."""
+    return apify_service.run_apify_profile_actor(
+        linkedin_url,
+        first_name=first_name,
+        last_name=last_name,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def cached_contact_compass_lookup(linkedin_url: str):
+    """Cache Contact Compass email lookups per LinkedIn URL."""
+    return contact_compass_service.find_email_by_linkedin(linkedin_url)
+
+
 debug = False
+
+
+# ---------------------------------------------------------------------------
+# Sidebar & Cache Management
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.subheader("Cache Controls")
+    if st.button("Clear Search & API Cache", type="secondary"):
+        st.cache_data.clear()
+        st.success("Cache cleared successfully!")
 
 # ---------------------------------------------------------------------------
 # Page header
@@ -126,16 +169,32 @@ if st.session_state.get("phase") == "input":
 with st.form("lead_search_form"):
     event_name = st.text_input("Event Name:", placeholder="e.g. IDA 2026")
     market = st.text_input("Market / Industry:", placeholder="e.g. Automobile")
+    product = st.text_input(
+        "Product / Solution (optional):",
+        placeholder="e.g. electric car, CRM software, industrial sensors",
+        help="If filled, the LLM will find companies that buy or use this product and target their decision-makers.",
+    )
     num_leads = st.selectbox("Number of leads:", options=[10, 15, 20], index=1)
+    discovery_method = st.radio(
+        "Discovery Method",
+        options=["Fast (LLM + Google Search)", "OpenOutreach (slow)"],
+        index=0,
+        horizontal=True,
+        help="Fast uses Groq + Parallel Google Custom Search API to find LinkedIn URLs directly. OpenOutreach is the original CLI pipeline.",
+    )
     find_leads_clicked = st.form_submit_button("Find Leads", type="primary")
 
 if find_leads_clicked:
-    if not event_name.strip() or not market.strip():
-        st.error("Please fill in both Event Name and Market / Industry.")
+    _has_product = bool(product.strip())
+    _has_event_market = bool(event_name.strip()) and bool(market.strip())
+    if not _has_product and not _has_event_market:
+        st.error("Please fill in either the Product / Solution, or both Event Name and Market / Industry.")
     else:
         st.session_state.event_name = event_name.strip()
         st.session_state.market = market.strip()
+        st.session_state.product = product.strip()
         st.session_state.num_leads = num_leads
+        st.session_state.discovery_method = discovery_method
         st.session_state.targeting = None
         st.session_state.oo_result = None
         st.session_state.leads = []
@@ -150,7 +209,35 @@ if find_leads_clicked:
 
         if not groq_service.has_api_key():
             st.error("Groq API key is missing. Add GROQ_API_KEY to your .env file.")
+        elif st.session_state.discovery_method == "Fast (LLM + Google Search)":
+            # Fast path: LLM + Parallel Google / DDG search — skip targeting review step,
+            # run discovery immediately and jump straight to results.
+            with st.spinner(
+                f"Finding leads for **{event_name.strip()}** / **{market.strip()}** "
+                f"using LLM + Parallel Google Search…"
+            ):
+                try:
+                    fast_leads = cached_find_leads(
+                        event_name=st.session_state.event_name,
+                        market=st.session_state.market,
+                        num_leads=st.session_state.num_leads,
+                        product=st.session_state.product,
+                    )
+                    from models.schemas import OpenOutreachResult
+                    st.session_state.oo_result = OpenOutreachResult(
+                        leads=fast_leads,
+                        command="(LLM + Parallel Google Search)",
+                        stdout="",
+                        stderr="",
+                        exit_code=0,
+                    )
+                    st.session_state.leads = fast_leads
+                    st.session_state.phase = "results"
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(f"Fast lead discovery failed:\n\n{exc}")
         else:
+            # OpenOutreach path: generate targeting first, then show review step.
             with st.spinner("Generating targeting instructions with Groq..."):
                 try:
                     targeting = groq_service.generate_targeting_instructions(
@@ -186,7 +273,8 @@ if st.session_state.get("targeting") is not None:
         st.caption(
             f"This will run OpenOutreach discovery to find "
             f"{st.session_state.num_leads} qualified leads for "
-            f"**{st.session_state.event_name}** / **{st.session_state.market}**."
+            f"**{st.session_state.event_name}** / **{st.session_state.market}**. "
+            f"Switch to **Fast (LLM + Google Search)** for a much quicker alternative."
         )
 
     if run_search:
@@ -254,11 +342,17 @@ if st.session_state.phase == "results":
         st.stop()
 
     if not oo_result.leads:
-        st.warning(
-            "OpenOutreach completed but returned no leads. "
-            "Check the Debug Output for what it found, and verify your "
-            "OPENOUTFIND_* configuration and BetterContact key."
-        )
+        if st.session_state.discovery_method == "Fast (LLM + Google Search)":
+            st.warning(
+                "Fast lead discovery returned 0 leads. "
+                "Verify your GROQ_API_KEY, or check if your Google Custom Search API key is enabled in Google Cloud Console."
+            )
+        else:
+            st.warning(
+                "OpenOutreach completed but returned no leads. "
+                "Check the Debug Output for what it found, and verify your "
+                "OPENOUTFIND_* configuration and BetterContact key."
+            )
         if debug:
             debug_expander("Debug: OpenOutreach stdout", oo_result.stdout)
             debug_expander("Debug: OpenOutreach stderr", oo_result.stderr)
@@ -360,7 +454,7 @@ if st.session_state.phase == "results":
 
             try:
                 with st.spinner(f"HarvestAPI: deep-enriching profile for {lead.name}..."):
-                    profile_result = apify_service.run_apify_profile_actor(
+                    profile_result = cached_apify_profile_actor(
                         lead.linkedin_url,
                         first_name=lead.first_name,
                         last_name=lead.last_name,
@@ -379,7 +473,7 @@ if st.session_state.phase == "results":
                 else:
                     try:
                         with st.spinner(f"Contact Compass: finding email for {lead.name}..."):
-                            cc_email, cc_status, cc_raw = contact_compass_service.find_email_by_linkedin(
+                            cc_email, cc_status, cc_raw = cached_contact_compass_lookup(
                                 lead.linkedin_url
                             )
                         profile = enrich[i]
