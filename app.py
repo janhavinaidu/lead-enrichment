@@ -12,6 +12,7 @@ Functional prototype to verify the ROX lead-generation pipeline end to end:
         -> review / approve (SMTP not connected yet)
 """
 
+import hashlib
 import json
 import os
 import tempfile
@@ -56,6 +57,7 @@ st.session_state.setdefault("email_drafts", {})          # lead index -> EmailDr
 st.session_state.setdefault("approved", set())
 st.session_state.setdefault("search_ran", False)
 st.session_state.setdefault("emails_generated", False)
+st.session_state.setdefault("emails_searched", False)
 st.session_state.setdefault("discovery_method", "Fast (LLM + Google Search)")
 st.session_state.setdefault("product", "")
 
@@ -85,15 +87,69 @@ def _lead_from_saved(row: Dict[str, Any]) -> Lead:
 # ---------------------------------------------------------------------------
 # Cached operations (LLM search, Apify profile enrichment, Contact Compass)
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=86400)
+def _discovery_cache_key(event_name: str, market: str, product: str, num_leads: int) -> str:
+    """Stable key for the persistent discovery cache (per product/market)."""
+    raw = "|".join(
+        [
+            (event_name or "").strip().lower(),
+            (market or "").strip().lower(),
+            (product or "").strip().lower(),
+            str(num_leads),
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _lead_to_dict(lead: Lead) -> Dict[str, str]:
+    return {
+        "first_name": lead.first_name,
+        "last_name": lead.last_name,
+        "company": lead.company,
+        "title": lead.title,
+        "website": lead.website,
+        "linkedin_url": lead.linkedin_url,
+        "reason": lead.reason,
+        "email": lead.email,
+        "lead_id": lead.lead_id,
+    }
+
+
+@st.cache_data(show_spinner=False)
 def cached_find_leads(event_name: str, market: str, num_leads: int, product: str) -> List[Lead]:
-    """Cache lead search results for 24 hours based on search inputs."""
-    return linkedin_finder_service.find_leads(
+    """Discover leads, saved to SQLite so repeat searches for the same
+    product / event / market load instantly instead of re-running the search."""
+    cache_key = _discovery_cache_key(event_name, market, product, num_leads)
+
+    cached = db.get_discovery_cache(cache_key)
+    if cached:
+        try:
+            rows = json.loads(cached["leads_json"])
+            if isinstance(rows, list):
+                return [Lead.from_dict(r) for r in rows]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    leads = linkedin_finder_service.find_leads(
         event_name=event_name,
         market=market,
         num_leads=num_leads,
         product=product,
     )
+
+    try:
+        if leads:
+            db.save_discovery_cache(
+                cache_key,
+                event_name or "",
+                market or "",
+                product or "",
+                num_leads,
+                json.dumps([_lead_to_dict(l) for l in leads], default=str),
+            )
+    except Exception:
+        pass  # caching must never break the actual search flow
+
+    return leads
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -107,9 +163,61 @@ def cached_apify_profile_actor(linkedin_url: str, first_name: str = "", last_nam
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def cached_contact_compass_lookup(linkedin_url: str):
-    """Cache Contact Compass email lookups per LinkedIn URL."""
-    return contact_compass_service.find_email_by_linkedin(linkedin_url)
+def _cached_contact_compass_lookup(
+    linkedin_url: str,
+    first_name: str = "",
+    last_name: str = "",
+    company: str = "",
+    domain: str = "",
+    max_lookups: int = 7,
+    timeout_seconds: int = 15,
+):
+    """Cache Contact Compass email lookups per LinkedIn URL and person details."""
+    return contact_compass_service.find_email_by_linkedin(
+        linkedin_url,
+        first_name=first_name,
+        last_name=last_name,
+        company=company,
+        domain=domain,
+        max_lookups=max_lookups,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def cached_contact_compass_lookup(
+    linkedin_url: str,
+    first_name: str = "",
+    last_name: str = "",
+    company: str = "",
+    domain: str = "",
+    max_lookups: int = 7,
+    timeout_seconds: int = 15,
+):
+    """Look up an email, caching only successful hits.
+
+    Failed (empty) lookups are re-tried live on every run so a stale 24h cache
+    miss never hides an email that a later attempt manages to find.
+    """
+    email, status, raw = _cached_contact_compass_lookup(
+        linkedin_url,
+        first_name=first_name,
+        last_name=last_name,
+        company=company,
+        domain=domain,
+        max_lookups=max_lookups,
+        timeout_seconds=timeout_seconds,
+    )
+    if email:
+        return email, status, raw
+    return contact_compass_service.find_email_by_linkedin(
+        linkedin_url,
+        first_name=first_name,
+        last_name=last_name,
+        company=company,
+        domain=domain,
+        max_lookups=max_lookups,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 debug = False
@@ -122,6 +230,7 @@ with st.sidebar:
     st.subheader("Cache Controls")
     if st.button("Clear Search & API Cache", type="secondary"):
         st.cache_data.clear()
+        db.clear_discovery_cache()
         st.success("Cache cleared successfully!")
 
 # ---------------------------------------------------------------------------
@@ -180,7 +289,7 @@ with st.form("lead_search_form"):
         options=["Fast (LLM + Google Search)", "OpenOutreach (slow)"],
         index=0,
         horizontal=True,
-        help="Fast uses Groq + Parallel Google Custom Search API to find LinkedIn URLs directly. OpenOutreach is the original CLI pipeline.",
+        help="Fast uses AI search to locate LinkedIn URLs directly. The pipeline option is slower but runs the full discovery workflow.",
     )
     find_leads_clicked = st.form_submit_button("Find Leads", type="primary")
 
@@ -205,6 +314,7 @@ if find_leads_clicked:
         st.session_state.approved = set()
         st.session_state.search_ran = False
         st.session_state.emails_generated = False
+        st.session_state.emails_searched = False
         st.session_state.phase = "input"
 
         if not groq_service.has_api_key():
@@ -214,7 +324,7 @@ if find_leads_clicked:
             # run discovery immediately and jump straight to results.
             with st.spinner(
                 f"Finding leads for **{event_name.strip()}** / **{market.strip()}** "
-                f"using LLM + Parallel Google Search…"
+                f"— orchestration agent is working in the background…"
             ):
                 try:
                     fast_leads = cached_find_leads(
@@ -238,7 +348,7 @@ if find_leads_clicked:
                     st.error(f"Fast lead discovery failed:\n\n{exc}")
         else:
             # OpenOutreach path: generate targeting first, then show review step.
-            with st.spinner("Generating targeting instructions with Groq..."):
+            with st.spinner("Orchestration agent is preparing the targeting strategy..."):
                 try:
                     targeting = groq_service.generate_targeting_instructions(
                         st.session_state.event_name, st.session_state.market
@@ -271,10 +381,10 @@ if st.session_state.get("targeting") is not None:
         )
     with col_b:
         st.caption(
-            f"This will run OpenOutreach discovery to find "
+            f"This will run the discovery engine to find "
             f"{st.session_state.num_leads} qualified leads for "
             f"**{st.session_state.event_name}** / **{st.session_state.market}**. "
-            f"Switch to **Fast (LLM + Google Search)** for a much quicker alternative."
+            f"Switch to the **Fast** method for a much quicker alternative."
         )
 
     if run_search:
@@ -295,8 +405,8 @@ if st.session_state.get("targeting") is not None:
                 st.session_state.targeting_file = tmp_path
 
             with st.spinner(
-                f"Running OpenOutreach discovery to find "
-                f"{st.session_state.num_leads} leads (this can take a while)..."
+                f"Orchestration agent is scanning for "
+                f"{st.session_state.num_leads} qualified leads (this can take a while)..."
             ):
                 try:
                     oo_result = openoutreach_service.find_leads(
@@ -453,7 +563,7 @@ if st.session_state.phase == "results":
                 continue
 
             try:
-                with st.spinner(f"HarvestAPI: deep-enriching profile for {lead.name}..."):
+                with st.spinner(f"Profile enrichment system is finding in-depth insights for {lead.name}..."):
                     profile_result = cached_apify_profile_actor(
                         lead.linkedin_url,
                         first_name=lead.first_name,
@@ -467,30 +577,7 @@ if st.session_state.phase == "results":
                     profile.name = lead.name
                 enrich[i] = profile
 
-                # Email lookup via Contact Compass REST API (from LinkedIn URL).
-                if not lead.linkedin_url:
-                    st.warning(f"No LinkedIn URL for {lead.name} - skipping email lookup.")
-                else:
-                    try:
-                        with st.spinner(f"Contact Compass: finding email for {lead.name}..."):
-                            cc_email, cc_status, cc_raw = cached_contact_compass_lookup(
-                                lead.linkedin_url
-                            )
-                        profile = enrich[i]
-                        if cc_email:
-                            profile.email = cc_email
-                            enrich[i] = profile
-                            if debug:
-                                debug_expander(
-                                    f"Debug: Contact Compass lookup — {lead.name}",
-                                    f"email: {cc_email}\nstatus: {cc_status}\n\n{cc_raw}",
-                                )
-                    except RuntimeError as exc:
-                        st.error(f"Contact Compass lookup failed for {lead.name}:\n\n{exc}")
-                        if debug:
-                            debug_expander(f"Debug: Contact Compass raw — {lead.name}", cc_raw) if "cc_raw" in locals() else None
-
-                # Persist enrichment
+                # Persist enrichment (email lookup happens in a later step)
                 db_id = st.session_state.lead_db_ids[i] if i < len(st.session_state.lead_db_ids) else None
                 if db_id:
                     db.insert_enrichment(
@@ -550,9 +637,62 @@ if st.session_state.phase == "results":
             if profile.email:
                 st.markdown(f"[{profile.email}](mailto:{profile.email})")
             else:
-                st.write("Email not found — Contact Compass returned no result for this profile.")
+                if st.session_state.emails_searched:
+                    st.write("Email not found for this profile.")
+                else:
+                    st.write("Click **Find Emails** below to look up contact details.")
 
-        # --- 5. Email generation ---
+        # --- 5. Find emails (fast, after profile enrichment) ---
+        st.divider()
+        st.subheader("Find Emails")
+        find_emails_clicked = st.button(
+            "Find Emails",
+            type="secondary",
+            disabled=not bool(st.session_state.enrichments) or st.session_state.emails_searched,
+            help="Find contact emails via Contact Compass (fast, ~10s per person) "
+            "with a name+domain pattern fallback.",
+        )
+
+        if find_emails_clicked or st.session_state.emails_searched:
+            st.session_state.emails_searched = True
+            enrich = st.session_state.enrichments
+            for i in sorted(st.session_state.enrichments):
+                lead = leads[i]
+                profile = enrich[i]
+                if profile.email:
+                    continue
+                try:
+                    with st.spinner(f"Contact discovery is locating the best contact details for {lead.name}..."):
+                        cc_email, cc_status, cc_raw = cached_contact_compass_lookup(
+                            lead.linkedin_url,
+                            first_name=lead.first_name,
+                            last_name=lead.last_name,
+                            company=lead.company,
+                            domain=contact_compass_service.extract_company_domain(
+                                profile.raw, lead.company
+                            ),
+                            max_lookups=2,
+                            timeout_seconds=3,
+                        )
+                    if cc_email:
+                        profile.email = cc_email
+                        enrich[i] = profile
+                        db_id = st.session_state.lead_db_ids[i] if i < len(st.session_state.lead_db_ids) else None
+                        if db_id:
+                            db.insert_enrichment(
+                                db_id,
+                                json.dumps(profile.raw, default=str) if profile.raw else json.dumps({}),
+                                profile.email,
+                            )
+                        if debug:
+                            debug_expander(
+                                f"Debug: Contact Compass lookup — {lead.name}",
+                                f"email: {cc_email}\nstatus: {cc_status}\n\n{cc_raw}",
+                            )
+                except RuntimeError as exc:
+                    st.error(f"Email lookup failed for {lead.name}:\n\n{exc}")
+
+        # --- 6. Email generation ---
         st.divider()
         st.subheader("Personalized Emails")
         generate_emails = st.button(
@@ -570,7 +710,7 @@ if st.session_state.phase == "results":
                 if i in drafts and drafts[i].body:
                     continue
 
-                with st.spinner(f"Writing personalized email for {lead.name} (Groq)..."):
+                with st.spinner(f"Crafting a personalized email for {lead.name} — refining the message in the background..."):
                     try:
                         draft = groq_service.generate_personalized_email(
                             event_name=st.session_state.event_name,
@@ -626,7 +766,7 @@ if st.session_state.emails_generated:
             if st.button("Regenerate", key=f"regenerate_{i}"):
                 profile = st.session_state.enrichments.get(i)
                 try:
-                    with st.spinner("Regenerating with Groq..."):
+                    with st.spinner("Refining the email draft..."):
                         new_draft = groq_service.generate_personalized_email(
                             event_name=st.session_state.event_name,
                             market=st.session_state.market,

@@ -53,6 +53,16 @@ CREATE TABLE IF NOT EXISTS email (
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS discovery_cache (
+    cache_key TEXT PRIMARY KEY,
+    event_name TEXT NOT NULL DEFAULT '',
+    market TEXT NOT NULL DEFAULT '',
+    product TEXT NOT NULL DEFAULT '',
+    num_leads INTEGER NOT NULL DEFAULT 0,
+    leads_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -185,3 +195,47 @@ def get_email(lead_id: int) -> Optional[Dict[str, Any]]:
 def update_email_status(email_id: int, status: str) -> None:
     with get_connection() as conn:
         conn.execute("UPDATE email SET status = ? WHERE id = ?", (status, email_id))
+
+
+# ----------------------------------------------------------------------------
+# Discovery cache (persistent Google/LLM lead-search results)
+# ----------------------------------------------------------------------------
+
+def save_discovery_cache(
+    cache_key: str,
+    event_name: str,
+    market: str,
+    product: str,
+    num_leads: int,
+    leads_json: str,
+) -> None:
+    """Persist lead-discovery results keyed by the normalized search inputs."""
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO discovery_cache
+                   (cache_key, event_name, market, product, num_leads, leads_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(cache_key) DO UPDATE SET
+                   event_name = excluded.event_name,
+                   market = excluded.market,
+                   product = excluded.product,
+                   num_leads = excluded.num_leads,
+                   leads_json = excluded.leads_json,
+                   created_at = excluded.created_at""",
+            (cache_key, event_name, market, product, num_leads, leads_json, utc_now()),
+        )
+
+
+def get_discovery_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Return a cached discovery result for a cache key, or None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM discovery_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def clear_discovery_cache() -> None:
+    """Drop all cached discovery results."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM discovery_cache")
