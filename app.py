@@ -33,6 +33,17 @@ from services import (
 )
 
 load_dotenv()
+
+# Streamlit Community Cloud: expose dashboard secrets as env vars so the
+# existing os.getenv(...) service calls work unchanged. No-op when running
+# locally with a .env file (or without any secrets configured).
+try:
+    for _key, _value in st.secrets.items():
+        if isinstance(_value, str) and not os.getenv(_key):
+            os.environ[_key] = _value
+except Exception:
+    pass
+
 db.init_db()
 
 st.set_page_config(page_title="ROX Test", page_icon="🚀", layout="wide")
